@@ -18,8 +18,8 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<OrderResponse> placeOrder(@Valid @RequestBody OrderRequest request) {
-        OrderResponse response = orderService.placeOrder(request);
-        return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        OrderResponse response = orderService.placeOrderAsync(request);
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(response);
     }
 
     @GetMapping("/{orderNumber}")
