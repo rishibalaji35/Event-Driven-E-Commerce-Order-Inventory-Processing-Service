@@ -18,8 +18,8 @@ public class GlobalExceptionHandler {
         return buildResponse(HttpStatus.NOT_FOUND, ex.getMessage());
     }
 
-    @ExceptionHandler(InsufficientStockException.class)
-    public ResponseEntity handleInsufficientStock(InsufficientStockException ex) {
+    @ExceptionHandler({InsufficientStockException.class, DuplicateRequestException.class})
+    public ResponseEntity handleConflict(RuntimeException ex) {
         return buildResponse(HttpStatus.CONFLICT, ex.getMessage());
     }
 

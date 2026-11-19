@@ -31,6 +31,7 @@ public class OrderService {
     private final InventoryAuditRepository auditRepository;
     private final ProductService productService;
     private final OrderEventProducer orderEventProducer;
+    private final PaymentService paymentService;
 
     /**
      * Day 4: Asynchronous Event-Driven Order Creation
@@ -87,15 +88,11 @@ public class OrderService {
         return mapToResponse(savedOrder);
     }
 
-    /**
-     * Executed asynchronously by Kafka Consumer to reserve stock with pessimistic locking
-     */
     @Transactional
     public void processInventoryReservation(OrderCreatedEvent event) {
         Order order = orderRepository.findByOrderNumber(event.getOrderNumber())
                 .orElseThrow(() -> new ResourceNotFoundException("Order not found: " + event.getOrderNumber()));
 
-        // Idempotency guard: skip if already processed
         if (order.getStatus() != OrderStatus.PENDING) {
             log.warn("Order {} already processed with status {}. Skipping duplicate Kafka event.",
                     order.getOrderNumber(), order.getStatus());
@@ -107,6 +104,7 @@ public class OrderService {
                     .sorted(Comparator.comparing(OrderCreatedEvent.OrderItemPayload::getSku))
                     .toList();
 
+            // Step 1: Reserve inventory with pessimistic locking
             for (OrderCreatedEvent.OrderItemPayload item : sortedItems) {
                 Product product = productRepository.findBySkuWithLock(item.getSku())
                         .orElseThrow(() -> new ResourceNotFoundException("Product not found: " + item.getSku()));
@@ -132,12 +130,40 @@ public class OrderService {
                         .build());
             }
 
+            // Step 2: Charge customer via Resilience4j-protected PaymentService
+            boolean paymentApproved = paymentService.processPayment(order.getOrderNumber(), order.getTotalAmount());
+
+            if (!paymentApproved) {
+                // Compensating Transaction: Release reserved stock back to available stock
+                for (OrderCreatedEvent.OrderItemPayload item : sortedItems) {
+                    Product product = productRepository.findBySkuWithLock(item.getSku()).orElseThrow();
+                    product.setAvailableStock(product.getAvailableStock() + item.getQuantity());
+                    product.setReservedStock(product.getReservedStock() - item.getQuantity());
+                    productRepository.save(product);
+
+                    productService.evictProductCache(product.getSku());
+
+                    auditRepository.save(InventoryAudit.builder()
+                            .product(product)
+                            .orderNumber(order.getOrderNumber())
+                            .changeType("RELEASED_PAYMENT_FAILED")
+                            .quantityChanged(item.getQuantity())
+                            .build());
+                }
+
+                order.setStatus(OrderStatus.FAILED);
+                order.setFailureReason("Payment gateway declined or unavailable (Circuit Breaker Fallback)");
+                orderRepository.save(order);
+                log.warn("Order {} marked FAILED and reserved inventory released.", order.getOrderNumber());
+                return;
+            }
+
+            // Step 3: Finalize order
             order.setStatus(OrderStatus.CONFIRMED);
             orderRepository.save(order);
-            log.info("Order {} transitioned to CONFIRMED after inventory reservation.", order.getOrderNumber());
+            log.info("Order {} transitioned to CONFIRMED after inventory & payment success.", order.getOrderNumber());
 
         } catch (InsufficientStockException ex) {
-            // Business failure: mark order FAILED cleanly without sending to Dead-Letter Queue
             order.setStatus(OrderStatus.FAILED);
             order.setFailureReason(ex.getMessage());
             orderRepository.save(order);
